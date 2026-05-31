@@ -45,6 +45,7 @@ public class MainWindowViewModel : ViewModelBase
 
     private readonly List<string> _pendingConnectionLogs = new(128);
     private readonly List<string> _pendingActivityLogs = new(64);
+    private readonly List<string> _connectionSearchMatches = new(256);
     private readonly object _connectionLogLock = new();
     private readonly object _activityLogLock = new();
     private DispatcherTimer? _connectionLogTimer;
@@ -97,6 +98,7 @@ public class MainWindowViewModel : ViewModelBase
                     _pendingConnectionLogs.Clear();
                 }
 
+                TrackConnectionSearchMatches(logsToAdd);
                 ConnectionsLog += string.Join("", logsToAdd);
 
                 var lines = ConnectionsLog.Split('\n');
@@ -187,6 +189,8 @@ public class MainWindowViewModel : ViewModelBase
             {
                 if (string.IsNullOrWhiteSpace(_connectionsSearchText))
                     FilteredConnectionsLog = _connectionsLog;
+                else
+                    FilteredConnectionsLog = BuildConnectionSearchOutput();
             }
         }
     }
@@ -239,7 +243,16 @@ public class MainWindowViewModel : ViewModelBase
     public string ConnectionsSearchText
     {
         get => _connectionsSearchText;
-        set => SetProperty(ref _connectionsSearchText, value);
+        set
+        {
+            if (SetProperty(ref _connectionsSearchText, value))
+            {
+                RebuildConnectionSearchMatches();
+                FilteredConnectionsLog = string.IsNullOrWhiteSpace(_connectionsSearchText)
+                    ? _connectionsLog
+                    : BuildConnectionSearchOutput();
+            }
+        }
     }
 
     public string ActivitySearchText
@@ -330,6 +343,7 @@ public class MainWindowViewModel : ViewModelBase
                     FilteredConnectionsLog = null!;
                     ConnectionsLog = "";
                     FilteredConnectionsLog = "";
+                    _connectionSearchMatches.Clear();
 
                     GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, true, true);
                     GC.WaitForPendingFinalizers();
@@ -558,6 +572,7 @@ public class MainWindowViewModel : ViewModelBase
             ConnectionsLog = "";
             ConnectionsSearchText = "";
             FilteredConnectionsLog = "";
+            _connectionSearchMatches.Clear();
 
             GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, true, true);
             GC.WaitForPendingFinalizers();
@@ -582,7 +597,10 @@ public class MainWindowViewModel : ViewModelBase
 
         SearchConnectionsCommand = new RelayCommand(() =>
         {
-            FilteredConnectionsLog = FilterLog(_connectionsLog, _connectionsSearchText);
+            RebuildConnectionSearchMatches();
+            FilteredConnectionsLog = string.IsNullOrWhiteSpace(_connectionsSearchText)
+                ? _connectionsLog
+                : BuildConnectionSearchOutput();
         });
 
         SearchActivityCommand = new RelayCommand(() =>
@@ -710,6 +728,56 @@ public class MainWindowViewModel : ViewModelBase
         }
 
         return sb.ToString();
+    }
+
+    private void RebuildConnectionSearchMatches()
+    {
+        _connectionSearchMatches.Clear();
+
+        if (string.IsNullOrWhiteSpace(_connectionsSearchText))
+            return;
+
+        AddConnectionSearchMatches(_connectionsLog);
+    }
+
+    private void TrackConnectionSearchMatches(IEnumerable<string> logsToAdd)
+    {
+        if (string.IsNullOrWhiteSpace(_connectionsSearchText))
+            return;
+
+        foreach (var log in logsToAdd)
+        {
+            AddConnectionSearchMatches(log);
+        }
+    }
+
+    private void AddConnectionSearchMatches(string log)
+    {
+        var lines = log.Split('\n');
+        foreach (var line in lines)
+        {
+            if (string.IsNullOrWhiteSpace(line))
+                continue;
+
+            if (line.Contains(_connectionsSearchText, StringComparison.OrdinalIgnoreCase))
+            {
+                _connectionSearchMatches.Add(line);
+            }
+        }
+
+        const int maxFilteredConnectionLines = 1000;
+        if (_connectionSearchMatches.Count > maxFilteredConnectionLines)
+        {
+            _connectionSearchMatches.RemoveRange(0, _connectionSearchMatches.Count - maxFilteredConnectionLines);
+        }
+    }
+
+    private string BuildConnectionSearchOutput()
+    {
+        if (_connectionSearchMatches.Count == 0)
+            return "";
+
+        return string.Join('\n', _connectionSearchMatches) + "\n";
     }
 
     private void LoadConfiguration()
