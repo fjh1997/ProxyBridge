@@ -192,7 +192,7 @@ static void format_ip_address(UINT32 ip, char *buffer, size_t size)
 
 static void format_ipv6_address(const UINT32 ip[4], char *buffer, size_t size)
 {
-    if (InetNtopA(AF_INET6, (void *)ip, buffer, (DWORD)size) == NULL)
+    if (InetNtopA(AF_INET6, (const void *)ip, buffer, (DWORD)size) == NULL)
         strncpy_s(buffer, size, "<invalid-ipv6>", _TRUNCATE);
 }
 
@@ -331,6 +331,384 @@ static void clear_pid_cache(void);
 static void update_has_active_rules(void);
 static void configure_local_relay_ports_from_env(void);
 
+typedef enum { PKT_SEND, PKT_SEND_CHECKSUM, PKT_CONSUMED } PacketAction;
+
+static PacketAction handle_ipv6_udp(unsigned char *packet, UINT packet_len,
+    WINDIVERT_ADDRESS *addr, PWINDIVERT_IPV6HDR ipv6_header, PWINDIVERT_UDPHDR udp_header)
+{
+    if (addr->Outbound)
+    {
+        if (udp_header->SrcPort == htons(g_local_udp_relay_port))
+        {
+            UINT16 dst_port = ntohs(udp_header->DstPort);
+            UINT32 orig_dest_ip6[4];
+            UINT16 orig_dest_port;
+
+            if (get_connection_ipv6(dst_port, orig_dest_ip6, &orig_dest_port))
+            {
+                ipv6_addr_copy(ipv6_header->SrcAddr, orig_dest_ip6);
+                udp_header->SrcPort = htons(orig_dest_port);
+            }
+            addr->Outbound = FALSE;
+        }
+        else if (is_connection_tracked_ipv6(ntohs(udp_header->SrcPort)))
+        {
+            udp_header->DstPort = htons(g_local_udp_relay_port);
+
+            BOOL is_loopback = is_ipv6_loopback_addr(ipv6_header->SrcAddr) &&
+                               is_ipv6_loopback_addr(ipv6_header->DstAddr);
+
+            if (!is_loopback)
+            {
+                UINT32 temp_addr[4];
+                ipv6_addr_copy(temp_addr, ipv6_header->DstAddr);
+                ipv6_addr_copy(ipv6_header->DstAddr, ipv6_header->SrcAddr);
+                ipv6_addr_copy(ipv6_header->SrcAddr, temp_addr);
+                addr->Outbound = FALSE;
+            }
+        }
+        else
+        {
+            UINT16 src_port = ntohs(udp_header->SrcPort);
+            UINT16 dest_port = ntohs(udp_header->DstPort);
+
+            if (!g_has_active_rules && g_connection_callback == NULL)
+                return PKT_SEND;
+
+            RuleAction action;
+            DWORD pid = 0;
+
+            if (dest_port == 53 && !g_dns_via_proxy)
+                action = RULE_ACTION_DIRECT;
+            else
+                action = check_process_rule_ipv6(ipv6_header->SrcAddr, src_port,
+                                                 ipv6_header->DstAddr, dest_port,
+                                                 TRUE, &pid);
+
+            if (action == RULE_ACTION_PROXY && !g_localhost_via_proxy &&
+                is_ipv6_loopback_addr(ipv6_header->DstAddr))
+            {
+                action = RULE_ACTION_DIRECT;
+            }
+
+            if (action == RULE_ACTION_PROXY &&
+                (is_ipv6_unspecified_addr(ipv6_header->DstAddr) ||
+                 is_ipv6_linklocal_or_multicast(ipv6_header->DstAddr)))
+            {
+                action = RULE_ACTION_DIRECT;
+            }
+
+            if (g_connection_callback != NULL && pid > 0)
+            {
+                char process_name[MAX_PROCESS_NAME];
+                if (get_process_name_from_pid(pid, process_name, sizeof(process_name)))
+                {
+                    char dest_ip_str[INET6_ADDRSTRLEN];
+                    char proxy_info[128];
+                    format_ipv6_address(ipv6_header->DstAddr, dest_ip_str, sizeof(dest_ip_str));
+
+                    if (action == RULE_ACTION_PROXY)
+                        snprintf(proxy_info, sizeof(proxy_info), "Proxy SOCKS5://%s:%d (IPv6 UDP)", g_proxy_host, g_proxy_port);
+                    else if (action == RULE_ACTION_DIRECT)
+                        snprintf(proxy_info, sizeof(proxy_info), "Direct (IPv6 UDP)");
+                    else
+                        snprintf(proxy_info, sizeof(proxy_info), "Blocked (IPv6 UDP)");
+
+                    const char* display_name = extract_filename(process_name);
+                    g_connection_callback(display_name, pid, dest_ip_str, dest_port, proxy_info);
+                }
+            }
+
+            if (action == RULE_ACTION_DIRECT)
+                return PKT_SEND;
+
+            if (action == RULE_ACTION_BLOCK)
+                return PKT_CONSUMED;
+
+            if (action == RULE_ACTION_PROXY)
+            {
+                add_connection_ipv6(src_port, ipv6_header->SrcAddr,
+                                    ipv6_header->DstAddr, dest_port);
+
+                udp_header->DstPort = htons(g_local_udp_relay_port);
+
+                BOOL is_loopback = is_ipv6_loopback_addr(ipv6_header->SrcAddr) &&
+                                   is_ipv6_loopback_addr(ipv6_header->DstAddr);
+
+                if (!is_loopback)
+                {
+                    UINT32 temp_addr[4];
+                    ipv6_addr_copy(temp_addr, ipv6_header->DstAddr);
+                    ipv6_addr_copy(ipv6_header->DstAddr, ipv6_header->SrcAddr);
+                    ipv6_addr_copy(ipv6_header->SrcAddr, temp_addr);
+                    addr->Outbound = FALSE;
+                }
+            }
+        }
+    }
+    else
+    {
+        if (udp_header->DstPort != htons(g_local_udp_relay_port))
+            return PKT_SEND;
+    }
+
+    return PKT_SEND_CHECKSUM;
+}
+
+static PacketAction handle_ipv6_tcp(unsigned char *packet, UINT packet_len,
+    WINDIVERT_ADDRESS *addr, PWINDIVERT_IPV6HDR ipv6_header, PWINDIVERT_TCPHDR tcp_header)
+{
+    if (addr->Outbound)
+    {
+        if (tcp_header->SrcPort == htons(g_local_relay_port))
+        {
+            UINT16 dst_port = ntohs(tcp_header->DstPort);
+            UINT32 orig_dest_ip6[4];
+            UINT16 orig_dest_port;
+
+            if (get_connection_ipv6(dst_port, orig_dest_ip6, &orig_dest_port))
+                tcp_header->SrcPort = htons(orig_dest_port);
+
+            BOOL is_loopback = is_ipv6_loopback_addr(ipv6_header->SrcAddr) &&
+                               is_ipv6_loopback_addr(ipv6_header->DstAddr);
+
+            if (!is_loopback)
+            {
+                UINT32 temp_addr[4];
+                ipv6_addr_copy(temp_addr, ipv6_header->DstAddr);
+                ipv6_addr_copy(ipv6_header->DstAddr, ipv6_header->SrcAddr);
+                ipv6_addr_copy(ipv6_header->SrcAddr, temp_addr);
+                addr->Outbound = FALSE;
+            }
+
+            if (tcp_header->Fin || tcp_header->Rst)
+                remove_connection_ipv6(dst_port);
+        }
+        else if (is_connection_tracked_ipv6(ntohs(tcp_header->SrcPort)))
+        {
+            UINT16 src_port = ntohs(tcp_header->SrcPort);
+
+            if (tcp_header->Fin || tcp_header->Rst)
+                remove_connection_ipv6(src_port);
+
+            tcp_header->DstPort = htons(g_local_relay_port);
+
+            BOOL is_loopback = is_ipv6_loopback_addr(ipv6_header->SrcAddr) &&
+                               is_ipv6_loopback_addr(ipv6_header->DstAddr);
+
+            if (!is_loopback)
+            {
+                UINT32 temp_addr[4];
+                ipv6_addr_copy(temp_addr, ipv6_header->DstAddr);
+                ipv6_addr_copy(ipv6_header->DstAddr, ipv6_header->SrcAddr);
+                ipv6_addr_copy(ipv6_header->SrcAddr, temp_addr);
+                addr->Outbound = FALSE;
+            }
+        }
+        else
+        {
+            UINT16 src_port = ntohs(tcp_header->SrcPort);
+            UINT16 orig_dest_port = ntohs(tcp_header->DstPort);
+
+            if (!g_has_active_rules && g_connection_callback == NULL)
+                return PKT_SEND;
+
+            RuleAction action;
+            DWORD pid = 0;
+
+            if (orig_dest_port == 53 && !g_dns_via_proxy)
+                action = RULE_ACTION_DIRECT;
+            else
+                action = check_process_rule_ipv6(ipv6_header->SrcAddr, src_port,
+                                                 ipv6_header->DstAddr, orig_dest_port,
+                                                 FALSE, &pid);
+
+            if (action == RULE_ACTION_PROXY && !g_localhost_via_proxy &&
+                is_ipv6_loopback_addr(ipv6_header->DstAddr))
+            {
+                action = RULE_ACTION_DIRECT;
+            }
+
+            if (action == RULE_ACTION_PROXY &&
+                (is_ipv6_unspecified_addr(ipv6_header->DstAddr) ||
+                 is_ipv6_linklocal_or_multicast(ipv6_header->DstAddr)))
+            {
+                action = RULE_ACTION_DIRECT;
+            }
+
+            if (g_connection_callback != NULL && tcp_header->Syn && !tcp_header->Ack && pid > 0)
+            {
+                char process_name[MAX_PROCESS_NAME];
+                if (get_process_name_from_pid(pid, process_name, sizeof(process_name)))
+                {
+                    char dest_ip_str[INET6_ADDRSTRLEN];
+                    char proxy_info[128];
+                    format_ipv6_address(ipv6_header->DstAddr, dest_ip_str, sizeof(dest_ip_str));
+
+                    if (action == RULE_ACTION_PROXY)
+                        snprintf(proxy_info, sizeof(proxy_info), "Proxy %s://%s:%d (IPv6)",
+                            g_proxy_type == PROXY_TYPE_HTTP ? "HTTP" : "SOCKS5",
+                            g_proxy_host, g_proxy_port);
+                    else if (action == RULE_ACTION_DIRECT)
+                        snprintf(proxy_info, sizeof(proxy_info), "Direct (IPv6)");
+                    else
+                        snprintf(proxy_info, sizeof(proxy_info), "Blocked (IPv6)");
+
+                    const char* display_name = extract_filename(process_name);
+                    g_connection_callback(display_name, pid, dest_ip_str, orig_dest_port, proxy_info);
+                }
+            }
+
+            if (action == RULE_ACTION_DIRECT)
+                return PKT_SEND;
+
+            if (action == RULE_ACTION_BLOCK)
+                return PKT_CONSUMED;
+
+            if (action == RULE_ACTION_PROXY)
+            {
+                UINT32 src_ip6[4];
+                ipv6_addr_copy(src_ip6, ipv6_header->SrcAddr);
+                UINT32 dest_ip6[4];
+                ipv6_addr_copy(dest_ip6, ipv6_header->DstAddr);
+
+                add_connection_ipv6(src_port, src_ip6, dest_ip6, orig_dest_port);
+
+                tcp_header->DstPort = htons(g_local_relay_port);
+
+                BOOL is_loopback = is_ipv6_loopback_addr(ipv6_header->SrcAddr) &&
+                                   is_ipv6_loopback_addr(ipv6_header->DstAddr);
+
+                if (!is_loopback)
+                {
+                    UINT32 temp_addr[4];
+                    ipv6_addr_copy(temp_addr, ipv6_header->DstAddr);
+                    ipv6_addr_copy(ipv6_header->DstAddr, ipv6_header->SrcAddr);
+                    ipv6_addr_copy(ipv6_header->SrcAddr, temp_addr);
+                    addr->Outbound = FALSE;
+                }
+            }
+        }
+    }
+    else
+    {
+        if (tcp_header->DstPort != htons(g_local_relay_port))
+            return PKT_SEND;
+    }
+
+    return PKT_SEND_CHECKSUM;
+}
+
+static PacketAction handle_ipv4_udp(unsigned char *packet, UINT packet_len,
+    WINDIVERT_ADDRESS *addr, PWINDIVERT_IPHDR ip_header, PWINDIVERT_UDPHDR udp_header)
+{
+    if (addr->Outbound)
+    {
+        if (udp_header->SrcPort == htons(g_local_udp_relay_port))
+        {
+            UINT16 dst_port = ntohs(udp_header->DstPort);
+            UINT32 orig_dest_ip;
+            UINT16 orig_dest_port;
+
+            if (get_connection(dst_port, &orig_dest_ip, &orig_dest_port))
+            {
+                ip_header->SrcAddr = orig_dest_ip;
+                udp_header->SrcPort = htons(orig_dest_port);
+            }
+            addr->Outbound = FALSE;
+        }
+        else if (is_connection_tracked(ntohs(udp_header->SrcPort)))
+        {
+            UINT16 src_port = ntohs(udp_header->SrcPort);
+            UINT32 temp_addr = ip_header->DstAddr;
+            udp_header->DstPort = htons(g_local_udp_relay_port);
+            ip_header->DstAddr = ip_header->SrcAddr;
+            ip_header->SrcAddr = temp_addr;
+            addr->Outbound = FALSE;
+        }
+        else
+        {
+            UINT16 src_port = ntohs(udp_header->SrcPort);
+            UINT32 src_ip = ip_header->SrcAddr;
+            UINT32 dest_ip = ip_header->DstAddr;
+            UINT16 dest_port = ntohs(udp_header->DstPort);
+
+            if (!g_has_active_rules && g_connection_callback == NULL)
+                return PKT_SEND;
+
+            RuleAction action;
+            DWORD pid = 0;
+
+            if (dest_port == 53 && !g_dns_via_proxy)
+                action = RULE_ACTION_DIRECT;
+            else
+                action = check_process_rule(src_ip, src_port, dest_ip, dest_port, TRUE, &pid);
+
+            BYTE dest_first_octet = (dest_ip >> 0) & 0xFF;
+            if (action == RULE_ACTION_PROXY && !g_localhost_via_proxy && dest_first_octet == 127)
+                action = RULE_ACTION_DIRECT;
+
+            if (action == RULE_ACTION_PROXY && is_broadcast_or_multicast(dest_ip))
+                action = RULE_ACTION_DIRECT;
+
+            if (action == RULE_ACTION_PROXY && (dest_port == 67 || dest_port == 68))
+                action = RULE_ACTION_DIRECT;
+
+            if (g_connection_callback != NULL && pid > 0)
+            {
+                char process_name[MAX_PROCESS_NAME];
+
+                if (pid > 0 && get_process_name_from_pid(pid, process_name, sizeof(process_name)))
+                {
+                    if (!is_connection_already_logged(pid, dest_ip, dest_port, action))
+                    {
+                        char dest_ip_str[32];
+                        format_ip_address(dest_ip, dest_ip_str, sizeof(dest_ip_str));
+
+                        char proxy_info[128];
+                        if (action == RULE_ACTION_PROXY)
+                            snprintf(proxy_info, sizeof(proxy_info), "Proxy SOCKS5://%s:%d (UDP)", g_proxy_host, g_proxy_port);
+                        else if (action == RULE_ACTION_DIRECT)
+                            snprintf(proxy_info, sizeof(proxy_info), "Direct (UDP)");
+                        else if (action == RULE_ACTION_BLOCK)
+                            snprintf(proxy_info, sizeof(proxy_info), "Blocked (UDP)");
+
+                        const char* display_name = extract_filename(process_name);
+                        g_connection_callback(display_name, pid, dest_ip_str, dest_port, proxy_info);
+
+                        if (g_traffic_logging_enabled)
+                            add_logged_connection(pid, dest_ip, dest_port, action);
+                    }
+                }
+            }
+
+            if (action == RULE_ACTION_BLOCK)
+                return PKT_CONSUMED;
+
+            if (action == RULE_ACTION_PROXY)
+            {
+                add_connection(src_port, src_ip, dest_ip, dest_port);
+
+                udp_header->DstPort = htons(g_local_udp_relay_port);
+                ip_header->DstAddr = htonl(INADDR_LOOPBACK);
+
+                BYTE src_first_octet = (ntohl(ip_header->SrcAddr) >> 24) & 0xFF;
+                BOOL src_is_loopback = (src_first_octet == 127);
+
+                if (!src_is_loopback)
+                    addr->Outbound = FALSE;
+            }
+        }
+    }
+    else
+    {
+        if (udp_header->DstPort != htons(g_local_udp_relay_port))
+            return PKT_SEND;
+    }
+
+    return PKT_SEND_CHECKSUM;
+}
+
 
 static DWORD WINAPI packet_processor(LPVOID arg)
 {
@@ -362,138 +740,14 @@ static DWORD WINAPI packet_processor(LPVOID arg)
 
             if (udp_header != NULL && tcp_header == NULL)
             {
-                if (addr.Outbound)
+                PacketAction pa = handle_ipv6_udp(packet, packet_len, &addr, ipv6_header, udp_header);
+                if (pa == PKT_CONSUMED)
+                    continue;
+                if (pa == PKT_SEND)
                 {
-                    if (udp_header->SrcPort == htons(g_local_udp_relay_port))
-                    {
-                        UINT16 dst_port = ntohs(udp_header->DstPort);
-                        UINT32 orig_dest_ip6[4];
-                        UINT16 orig_dest_port;
-
-                        if (get_connection_ipv6(dst_port, orig_dest_ip6, &orig_dest_port))
-                        {
-                            ipv6_addr_copy(ipv6_header->SrcAddr, orig_dest_ip6);
-                            udp_header->SrcPort = htons(orig_dest_port);
-                        }
-                        addr.Outbound = FALSE;
-                    }
-                    else if (is_connection_tracked_ipv6(ntohs(udp_header->SrcPort)))
-                    {
-                        udp_header->DstPort = htons(g_local_udp_relay_port);
-
-                        BOOL is_loopback = is_ipv6_loopback_addr(ipv6_header->SrcAddr) &&
-                                           is_ipv6_loopback_addr(ipv6_header->DstAddr);
-
-                        if (!is_loopback)
-                        {
-                            UINT32 temp_addr[4];
-                            ipv6_addr_copy(temp_addr, ipv6_header->DstAddr);
-                            ipv6_addr_copy(ipv6_header->DstAddr, ipv6_header->SrcAddr);
-                            ipv6_addr_copy(ipv6_header->SrcAddr, temp_addr);
-                            addr.Outbound = FALSE;
-                        }
-                    }
-                    else
-                    {
-                        UINT16 src_port = ntohs(udp_header->SrcPort);
-                        UINT16 dest_port = ntohs(udp_header->DstPort);
-
-                        if (!g_has_active_rules && g_connection_callback == NULL)
-                        {
-                            WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
-                            continue;
-                        }
-
-                        RuleAction action;
-                        DWORD pid = 0;
-
-                        if (dest_port == 53 && !g_dns_via_proxy)
-                            action = RULE_ACTION_DIRECT;
-                        else
-                            action = check_process_rule_ipv6(ipv6_header->SrcAddr, src_port,
-                                                             ipv6_header->DstAddr, dest_port,
-                                                             TRUE, &pid);
-
-                        if (action == RULE_ACTION_PROXY && !g_localhost_via_proxy &&
-                            is_ipv6_loopback_addr(ipv6_header->DstAddr))
-                        {
-                            action = RULE_ACTION_DIRECT;
-                        }
-
-                        if (action == RULE_ACTION_PROXY &&
-                            (is_ipv6_unspecified_addr(ipv6_header->DstAddr) ||
-                             is_ipv6_linklocal_or_multicast(ipv6_header->DstAddr)))
-                        {
-                            action = RULE_ACTION_DIRECT;
-                        }
-
-                        if (g_connection_callback != NULL && pid > 0)
-                        {
-                            char process_name[MAX_PROCESS_NAME];
-                            if (get_process_name_from_pid(pid, process_name, sizeof(process_name)))
-                            {
-                                char dest_ip_str[INET6_ADDRSTRLEN];
-                                char proxy_info[128];
-                                format_ipv6_address(ipv6_header->DstAddr, dest_ip_str, sizeof(dest_ip_str));
-
-                                if (action == RULE_ACTION_PROXY)
-                                {
-                                    snprintf(proxy_info, sizeof(proxy_info), "Proxy SOCKS5://%s:%d (IPv6 UDP)",
-                                        g_proxy_host, g_proxy_port);
-                                }
-                                else if (action == RULE_ACTION_DIRECT)
-                                {
-                                    snprintf(proxy_info, sizeof(proxy_info), "Direct (IPv6 UDP)");
-                                }
-                                else
-                                {
-                                    snprintf(proxy_info, sizeof(proxy_info), "Blocked (IPv6 UDP)");
-                                }
-
-                                const char* display_name = extract_filename(process_name);
-                                g_connection_callback(display_name, pid, dest_ip_str, dest_port, proxy_info);
-                            }
-                        }
-
-                        if (action == RULE_ACTION_DIRECT)
-                        {
-                            WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
-                            continue;
-                        }
-                        else if (action == RULE_ACTION_BLOCK)
-                        {
-                            continue;
-                        }
-                        else if (action == RULE_ACTION_PROXY)
-                        {
-                            add_connection_ipv6(src_port, ipv6_header->SrcAddr,
-                                                ipv6_header->DstAddr, dest_port);
-
-                            udp_header->DstPort = htons(g_local_udp_relay_port);
-
-                            BOOL is_loopback = is_ipv6_loopback_addr(ipv6_header->SrcAddr) &&
-                                               is_ipv6_loopback_addr(ipv6_header->DstAddr);
-
-                            if (!is_loopback)
-                            {
-                                UINT32 temp_addr[4];
-                                ipv6_addr_copy(temp_addr, ipv6_header->DstAddr);
-                                ipv6_addr_copy(ipv6_header->DstAddr, ipv6_header->SrcAddr);
-                                ipv6_addr_copy(ipv6_header->SrcAddr, temp_addr);
-                                addr.Outbound = FALSE;
-                            }
-                        }
-                    }
+                    WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                    continue;
                 }
-                else
-                {
-                    if (udp_header->DstPort != htons(g_local_udp_relay_port))
-                    {
-                        WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
-                        continue;
-                    }
-                }
-
                 WinDivertHelperCalcChecksums(packet, packet_len, &addr, 0);
                 if (!WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr))
                     log_message("Failed to send IPv6 UDP packet (%lu)", GetLastError());
@@ -503,305 +757,37 @@ static DWORD WINAPI packet_processor(LPVOID arg)
             if (tcp_header == NULL)
                 continue;
 
-            if (addr.Outbound)
             {
-                if (tcp_header->SrcPort == htons(g_local_relay_port))
-                {
-                    UINT16 dst_port = ntohs(tcp_header->DstPort);
-                    UINT32 orig_dest_ip6[4];
-                    UINT16 orig_dest_port;
-
-                    if (get_connection_ipv6(dst_port, orig_dest_ip6, &orig_dest_port))
-                        tcp_header->SrcPort = htons(orig_dest_port);
-
-                    BOOL is_loopback = is_ipv6_loopback_addr(ipv6_header->SrcAddr) &&
-                                       is_ipv6_loopback_addr(ipv6_header->DstAddr);
-
-                    if (!is_loopback)
-                    {
-                        UINT32 temp_addr[4];
-                        ipv6_addr_copy(temp_addr, ipv6_header->DstAddr);
-                        ipv6_addr_copy(ipv6_header->DstAddr, ipv6_header->SrcAddr);
-                        ipv6_addr_copy(ipv6_header->SrcAddr, temp_addr);
-                        addr.Outbound = FALSE;
-                    }
-
-                    if (tcp_header->Fin || tcp_header->Rst)
-                        remove_connection_ipv6(dst_port);
-                }
-                else if (is_connection_tracked_ipv6(ntohs(tcp_header->SrcPort)))
-                {
-                    UINT16 src_port = ntohs(tcp_header->SrcPort);
-
-                    if (tcp_header->Fin || tcp_header->Rst)
-                        remove_connection_ipv6(src_port);
-
-                    tcp_header->DstPort = htons(g_local_relay_port);
-
-                    BOOL is_loopback = is_ipv6_loopback_addr(ipv6_header->SrcAddr) &&
-                                       is_ipv6_loopback_addr(ipv6_header->DstAddr);
-
-                    if (!is_loopback)
-                    {
-                        UINT32 temp_addr[4];
-                        ipv6_addr_copy(temp_addr, ipv6_header->DstAddr);
-                        ipv6_addr_copy(ipv6_header->DstAddr, ipv6_header->SrcAddr);
-                        ipv6_addr_copy(ipv6_header->SrcAddr, temp_addr);
-                        addr.Outbound = FALSE;
-                    }
-                }
-                else
-                {
-                    UINT16 src_port = ntohs(tcp_header->SrcPort);
-                    UINT16 orig_dest_port = ntohs(tcp_header->DstPort);
-
-                    if (!g_has_active_rules && g_connection_callback == NULL)
-                    {
-                        WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
-                        continue;
-                    }
-
-                    RuleAction action;
-                    DWORD pid = 0;
-
-                    if (orig_dest_port == 53 && !g_dns_via_proxy)
-                        action = RULE_ACTION_DIRECT;
-                    else
-                        action = check_process_rule_ipv6(ipv6_header->SrcAddr, src_port,
-                                                         ipv6_header->DstAddr, orig_dest_port,
-                                                         FALSE, &pid);
-
-                    if (action == RULE_ACTION_PROXY && !g_localhost_via_proxy &&
-                        is_ipv6_loopback_addr(ipv6_header->DstAddr))
-                    {
-                        action = RULE_ACTION_DIRECT;
-                    }
-
-                    if (action == RULE_ACTION_PROXY &&
-                        (is_ipv6_unspecified_addr(ipv6_header->DstAddr) ||
-                         is_ipv6_linklocal_or_multicast(ipv6_header->DstAddr)))
-                    {
-                        action = RULE_ACTION_DIRECT;
-                    }
-
-                    if (g_connection_callback != NULL && tcp_header->Syn && !tcp_header->Ack && pid > 0)
-                    {
-                        char process_name[MAX_PROCESS_NAME];
-                        if (get_process_name_from_pid(pid, process_name, sizeof(process_name)))
-                        {
-                            char dest_ip_str[INET6_ADDRSTRLEN];
-                            char proxy_info[128];
-                            format_ipv6_address(ipv6_header->DstAddr, dest_ip_str, sizeof(dest_ip_str));
-
-                            if (action == RULE_ACTION_PROXY)
-                            {
-                                snprintf(proxy_info, sizeof(proxy_info), "Proxy %s://%s:%d (IPv6)",
-                                    g_proxy_type == PROXY_TYPE_HTTP ? "HTTP" : "SOCKS5",
-                                    g_proxy_host, g_proxy_port);
-                            }
-                            else if (action == RULE_ACTION_DIRECT)
-                            {
-                                snprintf(proxy_info, sizeof(proxy_info), "Direct (IPv6)");
-                            }
-                            else
-                            {
-                                snprintf(proxy_info, sizeof(proxy_info), "Blocked (IPv6)");
-                            }
-
-                            const char* display_name = extract_filename(process_name);
-                            g_connection_callback(display_name, pid, dest_ip_str, orig_dest_port, proxy_info);
-                        }
-                    }
-
-                    if (action == RULE_ACTION_DIRECT)
-                    {
-                        WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
-                        continue;
-                    }
-                    else if (action == RULE_ACTION_BLOCK)
-                    {
-                        continue;
-                    }
-                    else if (action == RULE_ACTION_PROXY)
-                    {
-                        add_connection_ipv6(src_port, ipv6_header->SrcAddr,
-                                            ipv6_header->DstAddr, orig_dest_port);
-
-                        tcp_header->DstPort = htons(g_local_relay_port);
-
-                        BOOL is_loopback_to_loopback = is_ipv6_loopback_addr(ipv6_header->SrcAddr) &&
-                                                       is_ipv6_loopback_addr(ipv6_header->DstAddr);
-                        if (!is_loopback_to_loopback)
-                        {
-                            UINT32 temp_addr[4];
-                            ipv6_addr_copy(temp_addr, ipv6_header->DstAddr);
-                            ipv6_addr_copy(ipv6_header->DstAddr, ipv6_header->SrcAddr);
-                            ipv6_addr_copy(ipv6_header->SrcAddr, temp_addr);
-                            addr.Outbound = FALSE;
-                        }
-                    }
-                }
-            }
-            else
-            {
-                if (tcp_header->DstPort != htons(g_local_relay_port))
+                PacketAction pa = handle_ipv6_tcp(packet, packet_len, &addr, ipv6_header, tcp_header);
+                if (pa == PKT_CONSUMED)
+                    continue;
+                if (pa == PKT_SEND)
                 {
                     WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
                     continue;
                 }
+                WinDivertHelperCalcChecksums(packet, packet_len, &addr, 0);
+                if (!WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr))
+                    log_message("Failed to send IPv6 packet (%lu)", GetLastError());
+                continue;
             }
-
-            WinDivertHelperCalcChecksums(packet, packet_len, &addr, 0);
-            if (!WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr))
-                log_message("Failed to send IPv6 packet (%lu)", GetLastError());
-            continue;
         }
 
         if (udp_header != NULL && tcp_header == NULL)
         {
-            if (addr.Outbound)
+            PacketAction pa = handle_ipv4_udp(packet, packet_len, &addr, ip_header, udp_header);
+            if (pa == PKT_CONSUMED)
+                continue;
+            if (pa == PKT_SEND)
             {
-                if (udp_header->SrcPort == htons(g_local_udp_relay_port))
-                {
-                    UINT16 dst_port = ntohs(udp_header->DstPort);
-                    UINT32 orig_dest_ip;
-                    UINT16 orig_dest_port;
-
-                    if (get_connection(dst_port, &orig_dest_ip, &orig_dest_port))
-                    {
-                        // Restore both source IP and port to original destination
-                        ip_header->SrcAddr = orig_dest_ip;
-                        udp_header->SrcPort = htons(orig_dest_port);
-                    }                    addr.Outbound = FALSE;
-                }
-                else if (is_connection_tracked(ntohs(udp_header->SrcPort)))
-                {
-                    UINT16 src_port = ntohs(udp_header->SrcPort);
-                    UINT32 temp_addr = ip_header->DstAddr;
-                    udp_header->DstPort = htons(g_local_udp_relay_port);
-                    ip_header->DstAddr = ip_header->SrcAddr;
-                    ip_header->SrcAddr = temp_addr;
-                    addr.Outbound = FALSE;
-                }
-                else
-                {
-                    UINT16 src_port = ntohs(udp_header->SrcPort);
-                    UINT32 src_ip = ip_header->SrcAddr;
-                    UINT32 dest_ip = ip_header->DstAddr;
-                    UINT16 dest_port = ntohs(udp_header->DstPort);
-
-                    // if no rule configuree all connection direct with no checks avoid unwanted memory and pocessing whcich could delay
-                    if (!g_has_active_rules && g_connection_callback == NULL)
-                    {
-                        // No rules and no logging - pass through immediately (no checksum needed for unmodified packets)
-                        WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
-                        continue;
-                    }
-
-                    RuleAction action;
-                    DWORD pid = 0;
-
-                    if (dest_port == 53 && !g_dns_via_proxy)
-                        action = RULE_ACTION_DIRECT;
-                    else
-                        action = check_process_rule(src_ip, src_port, dest_ip, dest_port, TRUE, &pid);
-
-                    // override PROXY to DIRECT if localhost proxy is disabled and destination is localhost
-                    BYTE dest_first_octet = (dest_ip >> 0) & 0xFF;
-                    if (action == RULE_ACTION_PROXY && !g_localhost_via_proxy && dest_first_octet == 127)
-                        action = RULE_ACTION_DIRECT;
-
-                    // Override PROXY to DIRECT for critical IPs and ports
-                    if (action == RULE_ACTION_PROXY && is_broadcast_or_multicast(dest_ip))
-                        action = RULE_ACTION_DIRECT;
-
-                    // Override PROXY to DIRECT for DHCP ports (67=server, 68=client)
-                    if (action == RULE_ACTION_PROXY && (dest_port == 67 || dest_port == 68))
-                        action = RULE_ACTION_DIRECT;
-
-                    // only log if callback is set
-                    // reuse pid from check_process_rule
-                    // CLI use no log flag
-                    if (g_connection_callback != NULL && pid > 0)
-                    {
-                        char process_name[MAX_PROCESS_NAME];
-
-                        if (pid > 0 && get_process_name_from_pid(pid, process_name, sizeof(process_name)))
-                        {
-                            if (!is_connection_already_logged(pid, dest_ip, dest_port, action))
-                            {
-                                char dest_ip_str[32];
-                                format_ip_address(dest_ip, dest_ip_str, sizeof(dest_ip_str));
-
-                                char proxy_info[128];
-                                if (action == RULE_ACTION_PROXY)
-                                {
-                                    snprintf(proxy_info, sizeof(proxy_info), "Proxy SOCKS5://%s:%d (UDP)",
-                                        g_proxy_host, g_proxy_port);
-                                }
-                                else if (action == RULE_ACTION_DIRECT)
-                                {
-                                    snprintf(proxy_info, sizeof(proxy_info), "Direct (UDP)");
-                                }
-                                else if (action == RULE_ACTION_BLOCK)
-                                {
-                                    snprintf(proxy_info, sizeof(proxy_info), "Blocked (UDP)");
-                                }
-
-                                const char* display_name = extract_filename(process_name);
-                                g_connection_callback(display_name, pid, dest_ip_str, dest_port, proxy_info);
-
-                                if (g_traffic_logging_enabled)
-                                {
-                                    add_logged_connection(pid, dest_ip, dest_port, action);
-                                }
-                            }
-                        }
-                    }
-
-                    if (action == RULE_ACTION_BLOCK)
-                    {
-                        continue;
-                    }
-
-                    if (action == RULE_ACTION_PROXY)
-                    {
-                        add_connection(src_port, src_ip, dest_ip, dest_port);
-
-                        // redirect to UDP relay server at 127.0.0.1:34011
-                        udp_header->DstPort = htons(g_local_udp_relay_port);
-                        ip_header->DstAddr = htonl(INADDR_LOOPBACK);
-
-                        // check if source is localhos
-                        BYTE src_first_octet = (ntohl(ip_header->SrcAddr) >> 24) & 0xFF;
-                        BOOL src_is_loopback = (src_first_octet == 127);
-
-                        if (!src_is_loopback)
-                        {
-                            // for non loopback source: mark as inbound
-                            addr.Outbound = FALSE;
-                        }
-                        // for loopback we need keep as outbound (127.x.x.x -> 127.0.0.1)
-                        // for a fucking stupid reason i missed this part for 6 months
-                    }
-                }
+                WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                continue;
             }
-            else
-            {
-                if (udp_header->DstPort != htons(g_local_udp_relay_port))
-                {
-                    // Unmodified packet no checksum needed
-                    WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
-                    continue;
-                }
-
-            }
-
-            // Modified UDP packet calculate checksums
             WinDivertHelperCalcChecksums(packet, packet_len, &addr, 0);
             WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
             continue;
-        }        // TCP packets only from here
+        }
+        // TCP packets only from here
         if (tcp_header == NULL)
             continue;
 
@@ -1011,7 +997,8 @@ static UINT32 resolve_hostname(const char *hostname)
         return ip;
 
     // Not an IP address, try DNS resolution
-    struct addrinfo hints, *result = NULL;
+    struct addrinfo hints;
+    struct addrinfo *result = NULL;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;  // IPv4 only
     hints.ai_socktype = SOCK_STREAM;
@@ -1052,7 +1039,9 @@ static BOOL resolve_proxy_address(struct sockaddr_storage *addr, int *addr_len)
     char port_str[16];
     snprintf(port_str, sizeof(port_str), "%u", g_proxy_port);
 
-    struct addrinfo hints, *result = NULL, *current = NULL;
+    struct addrinfo hints;
+    struct addrinfo *result = NULL;
+    struct addrinfo *current = NULL;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -1158,7 +1147,7 @@ static DWORD get_process_id_from_connection_ipv6(const UINT32 src_ip[4], UINT16 
 
     for (DWORD i = 0; i < tcp_table->dwNumEntries; i++)
     {
-        MIB_TCP6ROW_OWNER_PID *row = &tcp_table->table[i];
+        const MIB_TCP6ROW_OWNER_PID *row = &tcp_table->table[i];
 
         if (memcmp(row->ucLocalAddr, src_ip, 16) == 0 &&
             ntohs((UINT16)row->dwLocalPort) == src_port)
@@ -1265,7 +1254,7 @@ static DWORD get_process_id_from_udp_connection_ipv6(const UINT32 src_ip[4], UIN
 
     for (DWORD i = 0; i < udp_table->dwNumEntries; i++)
     {
-        MIB_UDP6ROW_OWNER_PID *row = &udp_table->table[i];
+        const MIB_UDP6ROW_OWNER_PID *row = &udp_table->table[i];
 
         if (memcmp(row->ucLocalAddr, src_ip, 16) == 0 &&
             ntohs((UINT16)row->dwLocalPort) == src_port)
@@ -1281,7 +1270,7 @@ static DWORD get_process_id_from_udp_connection_ipv6(const UINT32 src_ip[4], UIN
 
         for (DWORD i = 0; i < udp_table->dwNumEntries; i++)
         {
-            MIB_UDP6ROW_OWNER_PID *row = &udp_table->table[i];
+            const MIB_UDP6ROW_OWNER_PID *row = &udp_table->table[i];
 
             if (memcmp(row->ucLocalAddr, any_addr, 16) == 0 &&
                 ntohs((UINT16)row->dwLocalPort) == src_port)
@@ -1461,7 +1450,7 @@ static BOOL match_ipv6_pattern(const char *pattern, const UINT32 ip[4])
         char normalized_pattern[INET6_ADDRSTRLEN];
         strncpy_s(normalized_pattern, sizeof(normalized_pattern), pattern, _TRUNCATE);
 
-        char *star = strchr(normalized_pattern, '*');
+        const char *star = strchr(normalized_pattern, '*');
         if (star != NULL)
         {
             size_t prefix_len = star - normalized_pattern;
@@ -1479,7 +1468,9 @@ static BOOL match_ipv6_pattern(const char *pattern, const UINT32 ip[4])
         return _stricmp(normalized_pattern, addr_str) == 0;
     }
 
-    return memcmp(&parsed, ip, 16) == 0;
+    const UINT32 *parsed_u32 = (const UINT32 *)&parsed;
+    return parsed_u32[0] == ip[0] && parsed_u32[1] == ip[1] &&
+           parsed_u32[2] == ip[2] && parsed_u32[3] == ip[3];
 }
 
 static BOOL ipv6_match_wrapper(const char *token, const void *data)
@@ -1699,16 +1690,15 @@ static RuleAction match_rule(const char *process_name, UINT32 dest_ip, UINT16 de
             BOOL has_ip_filter = (strcmp(rule->target_hosts, "*") != 0);
             BOOL has_port_filter = (strcmp(rule->target_ports, "*") != 0);
 
+            if ((has_ip_filter || has_port_filter) &&
+                match_ip_list(rule->target_hosts, dest_ip) &&
+                match_port_list(rule->target_ports, dest_port))
+            {
+                return rule->action;
+            }
+
             if (has_ip_filter || has_port_filter)
             {
-                // Filtered wildcard - check if it matches
-                if (match_ip_list(rule->target_hosts, dest_ip) &&
-                    match_port_list(rule->target_ports, dest_port))
-                {
-                    // Matched! Return this rule's action
-                    return rule->action;
-                }
-                // Didn't match, continue
                 rule = rule->next;
                 continue;
             }
@@ -1723,15 +1713,11 @@ static RuleAction match_rule(const char *process_name, UINT32 dest_ip, UINT16 de
         }
 
         // Check if process name matches
-        if (match_process_list(rule->process_name, process_name))
+        if (match_process_list(rule->process_name, process_name) &&
+            match_ip_list(rule->target_hosts, dest_ip) &&
+            match_port_list(rule->target_ports, dest_port))
         {
-            // Process matched! Check IP and port filters
-            if (match_ip_list(rule->target_hosts, dest_ip) &&
-                match_port_list(rule->target_ports, dest_port))
-            {
-                // All filters matched! Return this rule's action
-                return rule->action;
-            }
+            return rule->action;
         }
 
         rule = rule->next;
@@ -1750,7 +1736,7 @@ static RuleAction match_rule(const char *process_name, UINT32 dest_ip, UINT16 de
 static RuleAction match_rule_ipv6(const char *process_name, const UINT32 dest_ip[4], UINT16 dest_port, BOOL is_udp)
 {
     PROCESS_RULE *rule = rules_list;
-    PROCESS_RULE *wildcard_rule = NULL;
+    const PROCESS_RULE *wildcard_rule = NULL;
 
     while (rule != NULL)
     {
@@ -1781,13 +1767,15 @@ static RuleAction match_rule_ipv6(const char *process_name, const UINT32 dest_ip
             BOOL has_ip_filter = (strcmp(rule->target_hosts, "*") != 0);
             BOOL has_port_filter = (strcmp(rule->target_ports, "*") != 0);
 
+            if ((has_ip_filter || has_port_filter) &&
+                match_ipv6_list(rule->target_hosts, dest_ip) &&
+                match_port_list(rule->target_ports, dest_port))
+            {
+                return rule->action;
+            }
+
             if (has_ip_filter || has_port_filter)
             {
-                if (match_ipv6_list(rule->target_hosts, dest_ip) &&
-                    match_port_list(rule->target_ports, dest_port))
-                {
-                    return rule->action;
-                }
                 rule = rule->next;
                 continue;
             }
@@ -1799,13 +1787,11 @@ static RuleAction match_rule_ipv6(const char *process_name, const UINT32 dest_ip
             continue;
         }
 
-        if (match_process_list(rule->process_name, process_name))
+        if (match_process_list(rule->process_name, process_name) &&
+            match_ipv6_list(rule->target_hosts, dest_ip) &&
+            match_port_list(rule->target_ports, dest_port))
         {
-            if (match_ipv6_list(rule->target_hosts, dest_ip) &&
-                match_port_list(rule->target_ports, dest_port))
-            {
-                return rule->action;
-            }
+            return rule->action;
         }
 
         rule = rule->next;
@@ -2125,7 +2111,7 @@ static int http_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port)
     char request[HTTP_BUFFER_SIZE];
     char response[4096];
     int len;
-    char *status_line;
+    const char *status_line;
     int status_code;
     BOOL use_auth = (g_proxy_username[0] != '\0');
 
@@ -2181,7 +2167,7 @@ static int http_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port)
     }
 
     status_code = 0;
-    char *code_start = strchr(status_line, ' ');
+    const char *code_start = strchr(status_line, ' ');
     if (code_start != NULL)
         status_code = atoi(code_start + 1);
 
@@ -2199,7 +2185,7 @@ static int http_connect_ipv6(SOCKET s, const UINT32 dest_ip[4], UINT16 dest_port
     char request[HTTP_BUFFER_SIZE];
     char response[4096];
     int len;
-    char *status_line;
+    const char *status_line;
     int status_code;
     BOOL use_auth = (g_proxy_username[0] != '\0');
     char ip_str[INET6_ADDRSTRLEN];
@@ -2238,7 +2224,7 @@ static int http_connect_ipv6(SOCKET s, const UINT32 dest_ip[4], UINT16 dest_port
     }
 
     len = recv(s, response, sizeof(response) - 1, 0);
-    if (len <= 0)
+    if (len <= 0 || (size_t)len >= sizeof(response))
     {
         log_message("HTTP IPv6: Failed to receive response");
         return -1;
@@ -2253,7 +2239,7 @@ static int http_connect_ipv6(SOCKET s, const UINT32 dest_ip[4], UINT16 dest_port
     }
 
     status_code = 0;
-    char *code_start = strchr(status_line, ' ');
+    const char *code_start = strchr(status_line, ' ');
     if (code_start != NULL)
         status_code = atoi(code_start + 1);
 
@@ -2327,7 +2313,7 @@ static int socks5_udp_associate(SOCKET s, struct sockaddr_storage *relay_addr, i
     if (getsockname(s, (struct sockaddr *)&local_sock_addr, &local_sock_len) == 0 &&
         local_sock_addr.ss_family == AF_INET6)
     {
-        struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *)&local_sock_addr;
+        const struct sockaddr_in6 *addr6 = (const struct sockaddr_in6 *)&local_sock_addr;
         request_ipv6 = !IN6_IS_ADDR_V4MAPPED(&addr6->sin6_addr);
     }
 
@@ -2483,7 +2469,7 @@ static DWORD WINAPI udp_relay_server(LPVOID arg)
 {
     WSADATA wsa_data;
     struct sockaddr_in6 local_addr;
-    struct sockaddr_storage from_addr;
+    struct sockaddr_storage from_addr = {0};
     unsigned char recv_buf[MAXBUF];
     unsigned char send_buf[MAXBUF];
     int recv_len, from_len;
@@ -2574,256 +2560,224 @@ static DWORD WINAPI udp_relay_server(LPVOID arg)
         }
 
         // Check if packet is from local application
-        if (FD_ISSET(udp_relay_socket, &read_fds))
+        if (!FD_ISSET(udp_relay_socket, &read_fds))
+            goto check_socks5;
+
+        from_len = sizeof(from_addr);
+        recv_len = recvfrom(udp_relay_socket, (char*)recv_buf, sizeof(recv_buf), 0,
+                           (struct sockaddr *)&from_addr, &from_len);
+
+        if (recv_len > 0)
         {
-            from_len = sizeof(from_addr);
-            recv_len = recvfrom(udp_relay_socket, (char*)recv_buf, sizeof(recv_buf), 0,
-                               (struct sockaddr *)&from_addr, &from_len);
+            UINT16 from_port = 0;
+            BOOL from_is_ipv6 = FALSE;
 
-            if (recv_len > 0)
+            if (from_addr.ss_family == AF_INET6)
             {
-                UINT16 from_port = 0;
-                BOOL from_is_ipv6 = FALSE;
+                const struct sockaddr_in6 *addr6 = (const struct sockaddr_in6 *)&from_addr;
+                from_port = ntohs(addr6->sin6_port);
+                from_is_ipv6 = !IN6_IS_ADDR_V4MAPPED(&addr6->sin6_addr);
+            }
+            else if (from_addr.ss_family == AF_INET)
+            {
+                const struct sockaddr_in *addr4 = (const struct sockaddr_in *)&from_addr;
+                from_port = ntohs(addr4->sin_port);
+            }
 
-                if (from_addr.ss_family == AF_INET6)
-                {
-                    struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *)&from_addr;
-                    from_port = ntohs(addr6->sin6_port);
-                    from_is_ipv6 = !IN6_IS_ADDR_V4MAPPED(&addr6->sin6_addr);
-                }
-                else if (from_addr.ss_family == AF_INET)
-                {
-                    struct sockaddr_in *addr4 = (struct sockaddr_in *)&from_addr;
-                    from_port = ntohs(addr4->sin_port);
-                }
+            if (from_port == 0)
+                continue;
 
-                if (from_port == 0)
-                    continue;
+            UINT32 dest_ip = 0;
+            UINT32 dest_ip6[4] = {0};
+            UINT16 dest_port = 0;
+            BOOL is_ipv6_dest = FALSE;
+            BOOL found = FALSE;
 
-                UINT32 dest_ip = 0;
-                UINT32 dest_ip6[4] = {0};
-                UINT16 dest_port = 0;
-                BOOL is_ipv6_dest = FALSE;
-                BOOL found = FALSE;
-
-                if (from_is_ipv6)
+            if (from_is_ipv6)
+            {
+                found = get_connection_ipv6(from_port, dest_ip6, &dest_port);
+                is_ipv6_dest = found;
+                if (!found)
+                    found = get_connection(from_port, &dest_ip, &dest_port);
+            }
+            else
+            {
+                found = get_connection(from_port, &dest_ip, &dest_port);
+                if (!found)
                 {
                     found = get_connection_ipv6(from_port, dest_ip6, &dest_port);
                     is_ipv6_dest = found;
-                    if (!found)
-                        found = get_connection(from_port, &dest_ip, &dest_port);
                 }
-                else
-                {
-                    found = get_connection(from_port, &dest_ip, &dest_port);
-                    if (!found)
-                    {
-                        found = get_connection_ipv6(from_port, dest_ip6, &dest_port);
-                        is_ipv6_dest = found;
-                    }
-                }
+            }
 
-                if (found)
+            if (found)
+            {
+                if (!udp_associate_connected)
                 {
-                    // Ensure UDP ASSOCIATE is established (retry if needed)
+                    udp_associate_connected = establish_udp_associate();
                     if (!udp_associate_connected)
                     {
-                        udp_associate_connected = establish_udp_associate();
-                        if (!udp_associate_connected)
-                        {
-                            log_message("[UDP RELAY] Cannot send - UDP ASSOCIATE not established");
-                            continue;
-                        }
+                        log_message("[UDP RELAY] Cannot send - UDP ASSOCIATE not established");
+                        continue;
                     }
+                }
 
-                    send_buf[0] = 0;
-                    send_buf[1] = 0;
-                    send_buf[2] = 0;
-                    int header_len;
+                send_buf[0] = 0;
+                send_buf[1] = 0;
+                send_buf[2] = 0;
+                int header_len;
 
-                    if (is_ipv6_dest)
-                    {
-                        if (recv_len > MAXBUF - 22)
-                            continue;
+                if (is_ipv6_dest)
+                {
+                    if (recv_len > MAXBUF - 22)
+                        continue;
 
-                        send_buf[3] = SOCKS5_ATYP_IPV6;
-                        memcpy(&send_buf[4], dest_ip6, 16);
-                        send_buf[20] = (dest_port >> 8) & 0xFF;
-                        send_buf[21] = (dest_port >> 0) & 0xFF;
-                        header_len = 22;
-                    }
-                    else
-                    {
-                        if (recv_len > MAXBUF - 10)
-                            continue;
-
-                        send_buf[3] = SOCKS5_ATYP_IPV4;
-                        send_buf[4] = (dest_ip >> 0) & 0xFF;
-                        send_buf[5] = (dest_ip >> 8) & 0xFF;
-                        send_buf[6] = (dest_ip >> 16) & 0xFF;
-                        send_buf[7] = (dest_ip >> 24) & 0xFF;
-                        send_buf[8] = (dest_port >> 8) & 0xFF;
-                        send_buf[9] = (dest_port >> 0) & 0xFF;
-                        header_len = 10;
-                    }
-
-                    memcpy(&send_buf[header_len], recv_buf, recv_len);
-
-                    int sent = sendto(socks5_udp_send_socket, (char*)send_buf, header_len + recv_len, 0,
-                          (struct sockaddr *)&socks5_udp_relay_addr, socks5_udp_relay_addr_len);
-
-                    if (sent == SOCKET_ERROR) {
-                        int err = WSAGetLastError();
-                        log_message("[UDP RELAY ERROR] Failed to send to SOCKS5 proxy: %d - closing connection", err);
-
-                        // connection is broken close all sockets and retry
-                        if (socks5_udp_socket != INVALID_SOCKET)
-                        {
-                            closesocket(socks5_udp_socket);
-                            socks5_udp_socket = INVALID_SOCKET;
-                        }
-                        if (socks5_udp_send_socket != INVALID_SOCKET)
-                        {
-                            closesocket(socks5_udp_send_socket);
-                            socks5_udp_send_socket = INVALID_SOCKET;
-                        }
-                        udp_associate_connected = FALSE;
-                    }
+                    send_buf[3] = SOCKS5_ATYP_IPV6;
+                    memcpy(&send_buf[4], dest_ip6, 16);
+                    send_buf[20] = (dest_port >> 8) & 0xFF;
+                    send_buf[21] = (dest_port >> 0) & 0xFF;
+                    header_len = 22;
                 }
                 else
                 {
-                    log_message("[UDP RELAY] No connection found for port %d", from_port);
+                    if (recv_len > MAXBUF - 10)
+                        continue;
+
+                    send_buf[3] = SOCKS5_ATYP_IPV4;
+                    send_buf[4] = (dest_ip >> 0) & 0xFF;
+                    send_buf[5] = (dest_ip >> 8) & 0xFF;
+                    send_buf[6] = (dest_ip >> 16) & 0xFF;
+                    send_buf[7] = (dest_ip >> 24) & 0xFF;
+                    send_buf[8] = (dest_port >> 8) & 0xFF;
+                    send_buf[9] = (dest_port >> 0) & 0xFF;
+                    header_len = 10;
                 }
+
+                memcpy(&send_buf[header_len], recv_buf, recv_len);
+
+                int sent = sendto(socks5_udp_send_socket, (char*)send_buf, header_len + recv_len, 0,
+                      (struct sockaddr *)&socks5_udp_relay_addr, socks5_udp_relay_addr_len);
+
+                if (sent == SOCKET_ERROR) {
+                    int err = WSAGetLastError();
+                    log_message("[UDP RELAY ERROR] Failed to send to SOCKS5 proxy: %d - closing connection", err);
+
+                    if (socks5_udp_socket != INVALID_SOCKET)
+                    {
+                        closesocket(socks5_udp_socket);
+                        socks5_udp_socket = INVALID_SOCKET;
+                    }
+                    if (socks5_udp_send_socket != INVALID_SOCKET)
+                    {
+                        closesocket(socks5_udp_send_socket);
+                        socks5_udp_send_socket = INVALID_SOCKET;
+                    }
+                    udp_associate_connected = FALSE;
+                }
+            }
+            else
+            {
+                log_message("[UDP RELAY] No connection found for port %d", from_port);
             }
         }
 
+check_socks5:
         // Check if packet is from SOCKS5 proxy (only if connected)
-        if (udp_associate_connected && socks5_udp_send_socket != INVALID_SOCKET && FD_ISSET(socks5_udp_send_socket, &read_fds))
+        if (!udp_associate_connected || socks5_udp_send_socket == INVALID_SOCKET || !FD_ISSET(socks5_udp_send_socket, &read_fds))
+            goto udp_loop_end;
+
+        from_len = sizeof(from_addr);
+        recv_len = recvfrom(socks5_udp_send_socket, (char*)recv_buf, sizeof(recv_buf), 0,
+                           (struct sockaddr *)&from_addr, &from_len);
+
+        if (recv_len == SOCKET_ERROR)
         {
-            from_len = sizeof(from_addr);
-            recv_len = recvfrom(socks5_udp_send_socket, (char*)recv_buf, sizeof(recv_buf), 0,
-                               (struct sockaddr *)&from_addr, &from_len);
-
-            if (recv_len == SOCKET_ERROR)
+            int err = WSAGetLastError();
+            log_message("[UDP RELAY ERROR] Failed to receive from SOCKS5 proxy: %d - closing connection", err);
+            if (socks5_udp_socket != INVALID_SOCKET)
             {
-                int err = WSAGetLastError();
-                log_message("[UDP RELAY ERROR] Failed to receive from SOCKS5 proxy: %d - closing connection", err);
-                if (socks5_udp_socket != INVALID_SOCKET)
-                {
-                    closesocket(socks5_udp_socket);
-                    socks5_udp_socket = INVALID_SOCKET;
-                }
-                if (socks5_udp_send_socket != INVALID_SOCKET)
-                {
-                    closesocket(socks5_udp_send_socket);
-                    socks5_udp_send_socket = INVALID_SOCKET;
-                }
-                udp_associate_connected = FALSE;
-                continue;
+                closesocket(socks5_udp_socket);
+                socks5_udp_socket = INVALID_SOCKET;
             }
-
-            if (recv_len > 0)
+            if (socks5_udp_send_socket != INVALID_SOCKET)
             {
-                // Packet from SOCKS5 proxy - decapsulate and forward to original sender
-                if (recv_len < 4)
-                    continue;
+                closesocket(socks5_udp_send_socket);
+                socks5_udp_send_socket = INVALID_SOCKET;
+            }
+            udp_associate_connected = FALSE;
+            continue;
+        }
 
-                // SOCKS5 UDP packet format: RSV(2) + FRAG(1) + ATYP(1) + DST.ADDR + DST.PORT + DATA
-                if (recv_buf[2] != 0x00)  // FRAG must be 0
-                    continue;
+        if (recv_len <= 0)
+            goto udp_loop_end;
 
-                if (recv_buf[3] == SOCKS5_ATYP_IPV4)
-                {
-                    if (recv_len < 10)
-                        continue;
+        // Packet from SOCKS5 proxy - decapsulate and forward to original sender
+        if (recv_len < 4)
+            goto udp_loop_end;
 
-                    UINT32 src_ip = (recv_buf[4] << 0) | (recv_buf[5] << 8) |
-                                   (recv_buf[6] << 16) | (recv_buf[7] << 24);
-                    UINT16 src_port = (recv_buf[8] << 8) | recv_buf[9];
+        if (recv_buf[2] != 0x00)  // FRAG must be 0
+            goto udp_loop_end;
 
-                    WaitForSingleObject(lock, INFINITE);
-                    BOOL found = FALSE;
-                    UINT32 target_ip = 0;
-                    UINT16 target_port = 0;
+        if (recv_buf[3] == SOCKS5_ATYP_IPV4)
+        {
+            if (recv_len < 10)
+                goto udp_loop_end;
 
-                    for (int i = 0; i < CONNECTION_HASH_SIZE && !found; i++)
-                    {
-                        CONNECTION_INFO *conn = connection_hash_table[i];
-                        while (conn != NULL)
-                        {
-                            if (conn->orig_dest_ip == src_ip && conn->orig_dest_port == src_port)
-                            {
-                                target_ip = conn->src_ip;
-                                target_port = conn->src_port;
-                                found = TRUE;
-                                break;
-                            }
-                            conn = conn->next;
-                        }
-                    }
-                    ReleaseMutex(lock);
+            UINT32 src_ip = (recv_buf[4] << 0) | (recv_buf[5] << 8) |
+                           (recv_buf[6] << 16) | (recv_buf[7] << 24);
+            UINT16 src_port = (recv_buf[8] << 8) | recv_buf[9];
 
-                    if (found)
-                    {
-                        struct sockaddr_in6 target_addr;
-                        memset(&target_addr, 0, sizeof(target_addr));
-                        target_addr.sin6_family = AF_INET6;
-                        target_addr.sin6_port = htons(target_port);
+            WaitForSingleObject(lock, INFINITE);
+            UINT32 target_ip = 0;
+            UINT16 target_port = 0;
+            BOOL found = find_connection_by_dest(src_ip, src_port, &target_ip, &target_port);
+            ReleaseMutex(lock);
 
-                        unsigned char *target_bytes = (unsigned char *)&target_addr.sin6_addr;
-                        target_bytes[10] = 0xFF;
-                        target_bytes[11] = 0xFF;
-                        memcpy(&target_bytes[12], &target_ip, 4);
+            if (found)
+            {
+                struct sockaddr_in6 target_addr;
+                memset(&target_addr, 0, sizeof(target_addr));
+                target_addr.sin6_family = AF_INET6;
+                target_addr.sin6_port = htons(target_port);
 
-                        sendto(udp_relay_socket, (char*)&recv_buf[10], recv_len - 10, 0,
-                              (struct sockaddr *)&target_addr, sizeof(target_addr));
-                    }
-                }
-                else if (recv_buf[3] == SOCKS5_ATYP_IPV6)
-                {
-                    if (recv_len < 22)
-                        continue;
+                unsigned char *target_bytes = (unsigned char *)&target_addr.sin6_addr;
+                target_bytes[10] = 0xFF;
+                target_bytes[11] = 0xFF;
+                memcpy(&target_bytes[12], &target_ip, 4);
 
-                    UINT32 src_ip6[4];
-                    memcpy(src_ip6, &recv_buf[4], 16);
-                    UINT16 src_port = (recv_buf[20] << 8) | recv_buf[21];
-
-                    WaitForSingleObject(lock, INFINITE);
-                    BOOL found = FALSE;
-                    UINT32 target_ip6[4];
-                    UINT16 target_port = 0;
-
-                    for (int i = 0; i < CONNECTION_HASH_SIZE && !found; i++)
-                    {
-                        CONNECTION_INFO_V6 *conn = connection_hash_table_v6[i];
-                        while (conn != NULL)
-                        {
-                            if (memcmp(conn->orig_dest_ip, src_ip6, 16) == 0 && conn->orig_dest_port == src_port)
-                            {
-                                ipv6_addr_copy(target_ip6, conn->src_ip);
-                                target_port = conn->src_port;
-                                found = TRUE;
-                                break;
-                            }
-                            conn = conn->next;
-                        }
-                    }
-                    ReleaseMutex(lock);
-
-                    if (found)
-                    {
-                        struct sockaddr_in6 target_addr;
-                        memset(&target_addr, 0, sizeof(target_addr));
-                        target_addr.sin6_family = AF_INET6;
-                        target_addr.sin6_port = htons(target_port);
-                        memcpy(&target_addr.sin6_addr, target_ip6, 16);
-
-                        sendto(udp_relay_socket, (char*)&recv_buf[22], recv_len - 22, 0,
-                              (struct sockaddr *)&target_addr, sizeof(target_addr));
-                    }
-                }
+                sendto(udp_relay_socket, (char*)&recv_buf[10], recv_len - 10, 0,
+                      (struct sockaddr *)&target_addr, sizeof(target_addr));
             }
         }
+        else if (recv_buf[3] == SOCKS5_ATYP_IPV6)
+        {
+            if (recv_len < 22)
+                goto udp_loop_end;
+
+            UINT32 src_ip6[4];
+            memcpy(src_ip6, &recv_buf[4], 16);
+            UINT16 src_port = (recv_buf[20] << 8) | recv_buf[21];
+
+            WaitForSingleObject(lock, INFINITE);
+            UINT32 target_ip6[4];
+            UINT16 target_port = 0;
+            BOOL found = find_connection_v6_by_dest(src_ip6, src_port, target_ip6, &target_port);
+            ReleaseMutex(lock);
+
+            if (found)
+            {
+                struct sockaddr_in6 target_addr;
+                memset(&target_addr, 0, sizeof(target_addr));
+                target_addr.sin6_family = AF_INET6;
+                target_addr.sin6_port = htons(target_port);
+                memcpy(&target_addr.sin6_addr, target_ip6, 16);
+
+                sendto(udp_relay_socket, (char*)&recv_buf[22], recv_len - 22, 0,
+                      (struct sockaddr *)&target_addr, sizeof(target_addr));
+            }
+        }
+
+udp_loop_end:;
     }
 
     closesocket(socks5_udp_socket);
@@ -2919,13 +2873,13 @@ static DWORD WINAPI local_proxy_server(LPVOID arg)
 
         if (client_addr.ss_family == AF_INET6)
         {
-            struct sockaddr_in6 *client_addr6 = (struct sockaddr_in6 *)&client_addr;
+            const struct sockaddr_in6 *client_addr6 = (const struct sockaddr_in6 *)&client_addr;
             client_port = ntohs(client_addr6->sin6_port);
             client_is_v4_mapped = IN6_IS_ADDR_V4MAPPED(&client_addr6->sin6_addr);
         }
         else if (client_addr.ss_family == AF_INET)
         {
-            struct sockaddr_in *client_addr4 = (struct sockaddr_in *)&client_addr;
+            const struct sockaddr_in *client_addr4 = (const struct sockaddr_in *)&client_addr;
             client_port = ntohs(client_addr4->sin_port);
         }
 
@@ -3348,6 +3302,40 @@ static void remove_connection_ipv6(UINT16 src_port)
     ReleaseMutex(lock);
 }
 
+static BOOL find_connection_by_dest(UINT32 dest_ip, UINT16 dest_port, UINT32 *out_src_ip, UINT16 *out_src_port)
+{
+    for (int i = 0; i < CONNECTION_HASH_SIZE; i++)
+    {
+        for (CONNECTION_INFO *conn = connection_hash_table[i]; conn != NULL; conn = conn->next)
+        {
+            if (conn->orig_dest_ip == dest_ip && conn->orig_dest_port == dest_port)
+            {
+                *out_src_ip = conn->src_ip;
+                *out_src_port = conn->src_port;
+                return TRUE;
+            }
+        }
+    }
+    return FALSE;
+}
+
+static BOOL find_connection_v6_by_dest(const UINT32 dest_ip[4], UINT16 dest_port, UINT32 out_src_ip[4], UINT16 *out_src_port)
+{
+    for (int i = 0; i < CONNECTION_HASH_SIZE; i++)
+    {
+        for (CONNECTION_INFO_V6 *conn = connection_hash_table_v6[i]; conn != NULL; conn = conn->next)
+        {
+            if (memcmp(conn->orig_dest_ip, dest_ip, 16) == 0 && conn->orig_dest_port == dest_port)
+            {
+                ipv6_addr_copy(out_src_ip, conn->src_ip);
+                *out_src_port = conn->src_port;
+                return TRUE;
+            }
+        }
+    }
+    return FALSE;
+}
+
 static void cleanup_stale_connections(void)
 {
     ULONGLONG now = GetTickCount64();
@@ -3746,7 +3734,8 @@ PROXYBRIDGE_API BOOL ProxyBridge_SetProxyConfig(ProxyType type, const char* prox
         return FALSE;
 
     char port_str[16];
-    struct addrinfo hints, *result = NULL;
+    struct addrinfo hints;
+    struct addrinfo *result = NULL;
     snprintf(port_str, sizeof(port_str), "%u", proxy_port);
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
